@@ -1,0 +1,148 @@
+{
+  "name": "remote-desktop-low-latency",
+  "version": "2.0.0",
+  "description": "High-performance remote desktop application with low latency optimizations",
+  "main": "server.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "server": "node server.js",
+    "server:dev": "nodemon server.js",
+    "build": "electron-builder",
+    "build:win": "electron-builder --win",
+    "build:mac": "electron-builder --mac",
+    "build:linux": "electron-builder --linux",
+    "dist": "npm run build",
+    "pack": "electron-builder --dir",
+    "postinstall": "electron-builder install-app-deps",
+    "test": "jest",
+    "lint": "eslint .",
+    "benchmark": "node scripts/benchmark.js"
+  },
+  "keywords": [
+    "remote-desktop",
+    "electron",
+    "low-latency",
+    "screen-sharing",
+    "remote-control",
+    "nut-js",
+    "cross-platform"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "@nut-tree-fork/nut-js": "^4.2.0",
+    "screenshot-desktop": "^1.15.0",
+    "socket.io": "^4.7.5",
+    "socket.io-client": "^4.7.5",
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "electron-store": "^8.1.0",
+    "qrcode": "^1.5.3"
+  },
+  "devDependencies": {
+    "electron": "^28.1.0",
+    "electron-builder": "^24.9.1",
+    "electron-reload": "^2.0.0-alpha.1",
+    "nodemon": "^3.0.2",
+    "eslint": "^8.56.0",
+    "jest": "^29.7.0"
+  },
+  "engines": {
+    "node": ">=16.0.0",
+    "npm": ">=8.0.0"
+  },
+  "build": {
+    "appId": "com.yourcompany.remote-desktop",
+    "productName": "Remote Desktop Low Latency",
+    "copyright": "Copyright © 2024",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "server.js",
+      "renderer/**/*",
+      "assets/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "server.js",
+        "to": "server.js"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.ico",
+      "requestedExecutionLevel": "requireAdministrator"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.icns",
+      "category": "public.app-category.utilities",
+      "hardenedRuntime": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist"
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "deb",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "icon": "assets/icon.png",
+      "category": "Utility"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Remote Desktop Low Latency"
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "your-username",
+      "repo": "remote-desktop-low-latency"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-username/remote-desktop-low-latency.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-username/remote-desktop-low-latency/issues"
+  },
+  "homepage": "https://github.com/your-username/remote-desktop-low-latency#readme"
+}
