@@ -4,7 +4,7 @@
   "description": "High-performance remote desktop application with low latency optimizations",
   "main": "server.js",
   "scripts": {
-    "start": "electron .",
+    "start": "node server.js",
     "dev": "electron . --dev",
     "server": "node server.js",
     "server:dev": "nodemon server.js",
@@ -145,4 +145,5 @@
     "url": "https://github.com/your-username/remote-desktop-low-latency/issues"
   },
   "homepage": "https://github.com/your-username/remote-desktop-low-latency#readme"
+
 }
