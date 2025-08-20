@@ -6,58 +6,29 @@ const path = require('path');
 const os = require('os');
 const { performance } = require('perf_hooks');
 
-// Cross-platform screen capture and control with Nut.js
-let screenshot, mouse, keyboard, screen, Point, Region, Button;
-
-try {
-    // Import @nut-tree-fork/nut-js components
-    const nut = require('@nut-tree-fork/nut-js');
-    mouse = nut.mouse;
-    keyboard = nut.keyboard;
-    screen = nut.screen;
-    Point = nut.Point;
-    Region = nut.Region;
-    Button = nut.Button;
-    
-    // Configure for low latency
-    screen.config.autoDelayMs = 0;
-    screen.config.highlightDurationMs = 0;
-    screen.config.highlightOpacity = 0;
-    mouse.config.autoDelayMs = 0;
-    mouse.config.mouseSpeed = 0; // Instant movement
-    keyboard.config.autoDelayMs = 0;
-    
-    console.log('✅ Nut.js library loaded and configured for low latency');
-} catch (error) {
-    console.warn('⚠️ Nut.js library not available:', error.message);
-}
-
-// Try screenshot-desktop with better options
-try {
-    screenshot = require('screenshot-desktop');
-    console.log('✅ Screenshot library loaded');
-} catch (error) {
-    console.warn('⚠️ Screenshot library not available:', error.message);
-}
-
 const app = express();
 const server = http.createServer(app);
 
-// Optimized Socket.IO configuration for low latency
+// Optimized Socket.IO configuration for low latency binary transmission
 const io = socketIo(server, {
     cors: {
         origin: "*",
         methods: ["GET", "POST", "PUT", "DELETE"],
         credentials: true
     },
-    transports: ['websocket'], // Prefer WebSocket for lower latency
+    transports: ['websocket'], // WebSocket only for lower latency
     allowEIO3: true,
     pingTimeout: 60000,
     pingInterval: 25000,
     upgradeTimeout: 10000,
-    maxHttpBufferSize: 10e6, // 10MB for large screen data
+    maxHttpBufferSize: 50e6, // 50MB for large binary frames
     compression: false, // Disable compression for lower latency
-    perMessageDeflate: false
+    perMessageDeflate: false,
+    // Enable binary support
+    parser: require('socket.io-parser'),
+    allowRequest: (req, callback) => {
+        callback(null, true);
+    }
 });
 
 // Middleware
@@ -71,23 +42,80 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 // Static files
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Store active sessions with performance tracking
+// Store active sessions with enhanced performance tracking
 const sessions = new Map();
 const connectedClients = new Map();
 
-// Optimized quality settings for low latency
-const QUALITY_SETTINGS = {
-    low: { fps: 15, quality: 60, interval: 67, compression: 'fast' },
-    medium: { fps: 24, quality: 70, interval: 42, compression: 'medium' },
-    high: { fps: 30, quality: 80, interval: 33, compression: 'medium' },
-    ultra: { fps: 60, quality: 90, interval: 17, compression: 'high' }
-};
+// Priority queue for different event types
+class PriorityEventQueue {
+    constructor() {
+        this.queues = {
+            1: [], // Keyboard events (highest priority)
+            2: [], // Mouse clicks
+            3: [], // Mouse moves
+            4: [], // Scroll events
+            5: []  // Frame data (lowest priority)
+        };
+        this.processing = false;
+    }
 
-// Screen capture optimization
-const CAPTURE_OPTIONS = {
-    format: 'jpg', // JPEG for better compression/speed ratio
-    quality: 80,
-    filename: null
+    enqueue(event, priority = 5) {
+        this.queues[priority].push({
+            ...event,
+            timestamp: performance.now()
+        });
+        
+        if (!this.processing) {
+            this.process();
+        }
+    }
+
+    async process() {
+        this.processing = true;
+        
+        // Process events in priority order
+        for (let priority = 1; priority <= 5; priority++) {
+            while (this.queues[priority].length > 0) {
+                const event = this.queues[priority].shift();
+                await this.handleEvent(event);
+            }
+        }
+        
+        this.processing = false;
+        
+        // Check if more events arrived during processing
+        if (this.hasEvents()) {
+            setImmediate(() => this.process());
+        }
+    }
+
+    hasEvents() {
+        return Object.values(this.queues).some(queue => queue.length > 0);
+    }
+
+    async handleEvent(event) {
+        try {
+            // Relay event to appropriate session participants
+            if (event.sessionId && event.targetSocket) {
+                io.to(event.targetSocket).emit(event.type, event.data);
+            } else if (event.sessionId) {
+                io.to(`session-${event.sessionId}`).emit(event.type, event.data);
+            }
+        } catch (error) {
+            console.error('❌ Event handling error:', error);
+        }
+    }
+}
+
+// Global event queue for prioritized processing
+const eventQueue = new PriorityEventQueue();
+
+// Enhanced Quality settings for adaptive FPS
+const ADAPTIVE_QUALITY_SETTINGS = {
+    low: { baseFps: 15, minFps: 8, maxFps: 20, latencyThreshold: 150 },
+    medium: { baseFps: 24, minFps: 15, maxFps: 30, latencyThreshold: 100 },
+    high: { baseFps: 30, minFps: 20, maxFps: 45, latencyThreshold: 80 },
+    ultra: { baseFps: 60, minFps: 30, maxFps: 60, latencyThreshold: 50 }
 };
 
 // Utility functions
@@ -120,54 +148,62 @@ function isValidSession(sessionId, password) {
     return session && session.password === password;
 }
 
-// Performance monitoring utilities
-class PerformanceMonitor {
+// Enhanced Performance monitoring for relay server
+class RelayPerformanceMonitor {
     constructor() {
         this.metrics = {
-            captureTime: 0,
-            encodeTime: 0,
-            transmitTime: 0,
-            totalLatency: 0,
-            frameCount: 0,
-            bytesTransferred: 0
+            eventsProcessed: 0,
+            binaryFramesRelayed: 0,
+            inputEventsRelayed: 0,
+            averageLatency: 0,
+            bytesTransferred: 0,
+            adaptiveFPSChanges: 0
         };
         this.startTime = performance.now();
+        this.latencyHistory = [];
     }
 
-    recordCapture(duration) {
-        this.metrics.captureTime = duration;
-    }
-
-    recordEncode(duration) {
-        this.metrics.encodeTime = duration;
-    }
-
-    recordTransmit(duration, bytes) {
-        this.metrics.transmitTime = duration;
+    recordEvent(type, latency, bytes = 0) {
+        this.metrics.eventsProcessed++;
         this.metrics.bytesTransferred += bytes;
-        this.metrics.frameCount++;
+        
+        if (type === 'frame') {
+            this.metrics.binaryFramesRelayed++;
+        } else if (['keyboard', 'mouse', 'scroll'].includes(type)) {
+            this.metrics.inputEventsRelayed++;
+        }
+
+        // Track latency
+        if (latency) {
+            this.latencyHistory.push(latency);
+            if (this.latencyHistory.length > 100) {
+                this.latencyHistory = this.latencyHistory.slice(-50);
+            }
+            
+            const sum = this.latencyHistory.reduce((a, b) => a + b, 0);
+            this.metrics.averageLatency = sum / this.latencyHistory.length;
+        }
     }
 
-    getTotalLatency() {
-        return this.metrics.captureTime + this.metrics.encodeTime + this.metrics.transmitTime;
+    recordAdaptiveFPSChange() {
+        this.metrics.adaptiveFPSChanges++;
     }
 
     getStats() {
         const runtime = (performance.now() - this.startTime) / 1000;
         return {
             ...this.metrics,
-            totalLatency: this.getTotalLatency(),
-            avgFps: runtime > 0 ? this.metrics.frameCount / runtime : 0,
-            avgBandwidth: runtime > 0 ? this.metrics.bytesTransferred / runtime : 0,
-            runtime: Math.round(runtime)
+            runtime: Math.round(runtime),
+            eventsPerSecond: runtime > 0 ? this.metrics.eventsProcessed / runtime : 0,
+            mbTransferred: this.metrics.bytesTransferred / (1024 * 1024)
         };
     }
 }
 
-// Routes with enhanced performance monitoring
+// Routes with enhanced binary support info
 app.get('/', (req, res) => {
     res.json({
-        name: 'Remote Desktop Server - Low Latency Edition',
+        name: 'Remote Desktop Relay Server - Binary Optimized',
         version: '2.0.0',
         platform: os.platform(),
         arch: os.arch(),
@@ -175,10 +211,12 @@ app.get('/', (req, res) => {
         sessions: sessions.size,
         clients: connectedClients.size,
         optimizations: {
-            nutJs: !!mouse,
-            screenshot: !!screenshot,
+            binaryFrames: true,
+            prioritizedEvents: true,
+            adaptiveFPS: true,
             webSocketOnly: true,
-            compressionDisabled: true
+            compressionDisabled: true,
+            inputPrioritization: true
         }
     });
 });
@@ -202,6 +240,7 @@ app.get('/health', (req, res) => {
         },
         system: getSystemInfo(),
         sessions: sessions.size,
+        eventQueueSize: Object.values(eventQueue.queues).reduce((sum, q) => sum + q.length, 0),
         timestamp: new Date().toISOString()
     });
 });
@@ -215,68 +254,24 @@ app.get('/api/sessions', (req, res) => {
         controllerCount: session.controllers.length,
         platform: session.platform,
         quality: session.quality,
+        currentFPS: session.currentFPS,
+        adaptiveFPSEnabled: session.adaptiveFPS,
         performance: session.performanceMonitor ? session.performanceMonitor.getStats() : null
     }));
     
     res.json(sessionList);
 });
 
-app.post('/api/sessions', (req, res) => {
-    const { quality = 'medium', platform = 'unknown' } = req.body;
-    
-    const sessionId = generateSessionId();
-    const password = generatePassword();
-    
-    const session = {
-        id: sessionId,
-        password,
-        createdAt: new Date(),
-        isActive: false,
-        hostSocket: null,
-        controllers: [],
-        quality,
-        platform,
-        captureInterval: null,
-        performanceMonitor: new PerformanceMonitor(),
-        lastFrameTime: 0,
-        frameBuffer: null,
-        deltaCompression: true,
-        lastScreenData: null
-    };
-    
-    sessions.set(sessionId, session);
-    
-    console.log(`🎯 Session created: ${sessionId} (${platform}, ${quality})`);
-    
-    res.json({
-        success: true,
-        sessionId,
-        password,
-        quality,
-        platform
-    });
-});
-
-app.delete('/api/sessions/:sessionId', (req, res) => {
-    const { sessionId } = req.params;
-    const session = sessions.get(sessionId);
-    
-    if (!session) {
-        return res.status(404).json({ error: 'Session not found' });
-    }
-    
-    endSession(sessionId);
-    res.json({ success: true, message: 'Session ended' });
-});
-
-// Socket.IO connection handling with optimized event processing
+// Socket.IO connection handling with binary frame support
 io.on('connection', (socket) => {
     const clientInfo = {
         id: socket.id,
         ip: socket.handshake.address,
         userAgent: socket.handshake.headers['user-agent'],
         connectedAt: new Date(),
-        latency: 0
+        latency: 0,
+        eventsSent: 0,
+        bytesSent: 0
     };
     
     connectedClients.set(socket.id, clientInfo);
@@ -284,16 +279,19 @@ io.on('connection', (socket) => {
     console.log(`🔗 Client connected: ${socket.id} from ${clientInfo.ip}`);
     console.log(`📊 Total clients: ${connectedClients.size}, Active sessions: ${sessions.size}`);
 
-    // Latency measurement
+    // Enhanced latency measurement with adaptive FPS
     socket.on('ping', (timestamp) => {
         const latency = Date.now() - timestamp;
         clientInfo.latency = latency;
         socket.emit('pong', { timestamp, latency });
+        
+        // Trigger adaptive FPS adjustment based on latency
+        updateAdaptiveFPS(socket.id, latency);
     });
 
     // Create session
     socket.on('create-session', (data) => {
-        const { quality = 'medium', platform = 'unknown' } = data;
+        const { quality = 'medium', platform = 'unknown', clientCapabilities = {} } = data;
         
         const sessionId = generateSessionId();
         const password = generatePassword();
@@ -307,12 +305,16 @@ io.on('connection', (socket) => {
             controllers: [],
             quality,
             platform,
-            captureInterval: null,
-            performanceMonitor: new PerformanceMonitor(),
+            performanceMonitor: new RelayPerformanceMonitor(),
+            // Adaptive FPS settings
+            adaptiveFPS: clientCapabilities.adaptiveFPS !== false,
+            currentFPS: ADAPTIVE_QUALITY_SETTINGS[quality].baseFps,
+            qualitySettings: ADAPTIVE_QUALITY_SETTINGS[quality],
             lastFrameTime: 0,
-            frameBuffer: null,
-            deltaCompression: true,
-            lastScreenData: null
+            frameCount: 0,
+            // Binary frame support
+            binaryFrames: clientCapabilities.binaryFrames !== false,
+            clientCapabilities
         };
         
         sessions.set(sessionId, session);
@@ -323,13 +325,15 @@ io.on('connection', (socket) => {
             sessionId,
             password,
             quality,
-            platform
+            platform,
+            adaptiveFPS: session.adaptiveFPS,
+            binaryFrames: session.binaryFrames
         });
         
-        console.log(`🎯 Session created: ${sessionId} by ${socket.id}`);
+        console.log(`🎯 Session created: ${sessionId} by ${socket.id} (${quality}, adaptive: ${session.adaptiveFPS})`);
     });
 
-    // Start hosting with optimized capture
+    // Start hosting
     socket.on('start-host', (data) => {
         const { sessionId, password } = data;
         
@@ -345,14 +349,15 @@ io.on('connection', (socket) => {
         }
         
         session.isActive = true;
-        session.performanceMonitor = new PerformanceMonitor();
+        session.performanceMonitor = new RelayPerformanceMonitor();
         
-        socket.emit('host-connected', { success: true });
+        socket.emit('host-connected', { 
+            success: true,
+            adaptiveFPS: session.adaptiveFPS,
+            currentFPS: session.currentFPS
+        });
         
-        // Start optimized screen capture
-        startOptimizedScreenCapture(sessionId);
-        
-        console.log(`🖥️ Host started: ${sessionId}`);
+        console.log(`🖥️ Host started: ${sessionId} (FPS: ${session.currentFPS})`);
     });
 
     // Join session as controller
@@ -388,6 +393,9 @@ io.on('connection', (socket) => {
                 id: sessionId,
                 platform: session.platform,
                 quality: session.quality,
+                currentFPS: session.currentFPS,
+                adaptiveFPS: session.adaptiveFPS,
+                binaryFrames: session.binaryFrames,
                 hostConnected: !!session.hostSocket
             }
         });
@@ -405,205 +413,142 @@ io.on('connection', (socket) => {
         console.log(`🎮 Controller joined: ${socket.id} -> ${sessionId} (${mode})`);
     });
 
-    // Optimized mouse events with Nut.js
-    socket.on('mouse-event', async (data) => {
-        const { sessionId, type, x, y, button, deltaX, deltaY, sensitivity = 1 } = data;
+    // Binary frame relay with prioritization
+    socket.on('screen-frame-binary', (data) => {
+        const { sessionId, frameBuffer, metadata } = data;
+        const session = sessions.get(sessionId);
+        
+        if (!session || session.hostSocket !== socket.id) return;
+        
+        const frameStartTime = performance.now();
+        
+        // Add to priority queue (lowest priority for frames)
+        eventQueue.enqueue({
+            type: 'screen-frame-binary',
+            sessionId,
+            data: { frameBuffer, metadata },
+            targetSocket: null // Broadcast to all controllers
+        }, 5);
+        
+        // Update performance stats
+        session.performanceMonitor.recordEvent('frame', 
+            performance.now() - frameStartTime, 
+            frameBuffer.byteLength
+        );
+        
+        session.frameCount++;
+        session.lastFrameTime = Date.now();
+        
+        // Adaptive FPS check
+        if (session.adaptiveFPS && session.frameCount % 30 === 0) {
+            checkAndAdjustFPS(sessionId);
+        }
+    });
+
+    // Legacy base64 frame relay (fallback)
+    socket.on('screen-frame-data', (data) => {
+        const { sessionId } = data;
+        const session = sessions.get(sessionId);
+        
+        if (!session || session.hostSocket !== socket.id) return;
+        
+        // Convert to binary if client supports it
+        if (session.binaryFrames && data.image) {
+            try {
+                const base64Data = data.image.split(',')[1];
+                const frameBuffer = Buffer.from(base64Data, 'base64');
+                
+                eventQueue.enqueue({
+                    type: 'screen-frame-binary',
+                    sessionId,
+                    data: { 
+                        frameBuffer,
+                        metadata: {
+                            width: data.width,
+                            height: data.height,
+                            timestamp: data.timestamp,
+                            frameNumber: data.frameNumber,
+                            format: 'jpeg'
+                        }
+                    }
+                }, 5);
+            } catch (error) {
+                console.error('❌ Binary conversion error:', error);
+                // Fallback to original format
+                eventQueue.enqueue({
+                    type: 'screen-update',
+                    sessionId,
+                    data: data
+                }, 5);
+            }
+        } else {
+            eventQueue.enqueue({
+                type: 'screen-update',
+                sessionId,
+                data: data
+            }, 5);
+        }
+        
+        session.performanceMonitor.recordEvent('frame', 0, 
+            data.image ? data.image.length : 0);
+    });
+
+    // Prioritized input event relay
+    socket.on('mouse-event', (data) => {
+        const { sessionId, type } = data;
         const session = sessions.get(sessionId);
         
         if (!session || !session.controllers.some(c => c.socketId === socket.id)) return;
         
-        if (!mouse) {
-            console.warn('⚠️ Nut.js mouse not available');
-            return;
-        }
+        // Prioritize input events
+        const priority = type === 'mousemove' ? 3 : 2;
         
-        try {
-            const startTime = performance.now();
-            
-            switch (type) {
-                case 'mousemove':
-                    const adjustedX = Math.round(x * sensitivity);
-                    const adjustedY = Math.round(y * sensitivity);
-                    
-                    await mouse.setPosition(new Point(adjustedX, adjustedY));
-                    
-                    // Broadcast to other controllers
-                    socket.to(`session-${sessionId}`).emit('mouse-position', { 
-                        x: adjustedX, 
-                        y: adjustedY 
-                    });
-                    break;
-                    
-                case 'mousedown':
-                    await mouse.setPosition(new Point(Math.round(x * sensitivity), Math.round(y * sensitivity)));
-                    const downBtn = button === 0 ? Button.LEFT : button === 2 ? Button.RIGHT : Button.MIDDLE;
-                    await mouse.pressButton(downBtn);
-                    break;
-                    
-                case 'mouseup':
-                    const upBtn = button === 0 ? Button.LEFT : button === 2 ? Button.RIGHT : Button.MIDDLE;
-                    await mouse.releaseButton(upBtn);
-                    break;
-                    
-                case 'wheel':
-                    // Nut.js scroll implementation
-                    const scrollAmount = Math.abs(deltaY || deltaX || 1);
-                    const direction = (deltaY || deltaX) > 0 ? 'down' : 'up';
-                    
-                    for (let i = 0; i < scrollAmount; i++) {
-                        if (direction === 'up') {
-                            await mouse.scrollUp(1);
-                        } else {
-                            await mouse.scrollDown(1);
-                        }
-                    }
-                    break;
-            }
-            
-            // Track mouse event latency
-            const processingTime = performance.now() - startTime;
-            if (processingTime > 5) { // Log if > 5ms
-                console.log(`🖱️ Mouse event took ${processingTime.toFixed(2)}ms`);
-            }
-            
-        } catch (error) {
-            console.error('❌ Mouse event error:', error.message);
-        }
+        eventQueue.enqueue({
+            type: 'remote-mouse-event',
+            sessionId,
+            data: data,
+            targetSocket: session.hostSocket
+        }, priority);
+        
+        session.performanceMonitor.recordEvent('mouse', 0);
+        clientInfo.eventsSent++;
     });
 
-    // Optimized keyboard events with Nut.js
-    socket.on('keyboard-event', async (data) => {
-        const { sessionId, type, key, code, ctrlKey, altKey, shiftKey, metaKey } = data;
+    socket.on('keyboard-event', (data) => {
+        const { sessionId } = data;
         const session = sessions.get(sessionId);
         
         if (!session || !session.controllers.some(c => c.socketId === socket.id && c.mode === 'control')) return;
         
-        if (!keyboard) {
-            console.warn('⚠️ Nut.js keyboard not available');
-            return;
-        }
+        // Highest priority for keyboard events
+        eventQueue.enqueue({
+            type: 'remote-keyboard-event',
+            sessionId,
+            data: data,
+            targetSocket: session.hostSocket
+        }, 1);
         
-        try {
-            const startTime = performance.now();
-            
-            // Map keys to Nut.js format
-            const { Key } = require('@nut-tree-fork/nut-js');
-            
-            let nutKey = key;
-            
-            // Map special keys
-            const keyMap = {
-                'ArrowUp': Key.Up,
-                'ArrowDown': Key.Down,
-                'ArrowLeft': Key.Left,
-                'ArrowRight': Key.Right,
-                'Enter': Key.Return,
-                'Escape': Key.Escape,
-                'Backspace': Key.Backspace,
-                'Delete': Key.Delete,
-                'Tab': Key.Tab,
-                'CapsLock': Key.CapsLock,
-                ' ': Key.Space,
-                'Control': Key.LeftControl,
-                'Alt': Key.LeftAlt,
-                'Shift': Key.LeftShift,
-                'Meta': Key.LeftSuper
-            };
-            
-            if (keyMap[key]) {
-                nutKey = keyMap[key];
-            } else if (key.length === 1) {
-                // Single character key
-                nutKey = key.toLowerCase();
-            }
-            
-            // Handle modifier combinations
-            const modifiers = [];
-            if (ctrlKey) modifiers.push(Key.LeftControl);
-            if (altKey) modifiers.push(Key.LeftAlt);
-            if (shiftKey) modifiers.push(Key.LeftShift);
-            if (metaKey) modifiers.push(Key.LeftSuper);
-            
-            switch (type) {
-                case 'keydown':
-                    if (modifiers.length > 0 && typeof nutKey === 'string') {
-                        // Key combination
-                        await keyboard.pressKey(...modifiers, nutKey);
-                        await keyboard.releaseKey(...modifiers, nutKey);
-                    } else if (typeof nutKey === 'string') {
-                        await keyboard.pressKey(nutKey);
-                    } else {
-                        await keyboard.pressKey(nutKey);
-                    }
-                    break;
-                    
-                case 'keyup':
-                    if (typeof nutKey === 'string') {
-                        await keyboard.releaseKey(nutKey);
-                    } else {
-                        await keyboard.releaseKey(nutKey);
-                    }
-                    break;
-            }
-            
-            // Track keyboard event latency
-            const processingTime = performance.now() - startTime;
-            if (processingTime > 10) { // Log if > 10ms
-                console.log(`⌨️ Keyboard event took ${processingTime.toFixed(2)}ms`);
-            }
-            
-        } catch (error) {
-            console.error('❌ Keyboard event error:', error.message);
-        }
+        session.performanceMonitor.recordEvent('keyboard', 0);
+        clientInfo.eventsSent++;
     });
 
-    // Optimized key combination handler
-    socket.on('key-combination', async (data) => {
-        const { sessionId, keys } = data;
+    socket.on('key-combination', (data) => {
+        const { sessionId } = data;
         const session = sessions.get(sessionId);
         
         if (!session || !session.controllers.some(c => c.socketId === socket.id && c.mode === 'control')) return;
         
-        if (!keyboard) {
-            console.warn('⚠️ Nut.js keyboard not available');
-            return;
-        }
+        eventQueue.enqueue({
+            type: 'remote-key-combination',
+            sessionId,
+            data: data,
+            targetSocket: session.hostSocket
+        }, 1);
         
-        try {
-            const { Key } = require('@nut-tree-fork/nut-js');
-            const startTime = performance.now();
-            
-            // Map key combination
-            const nutKeys = keys.map(key => {
-                switch (key.toLowerCase()) {
-                    case 'ctrl': return Key.LeftControl;
-                    case 'control': return Key.LeftControl;
-                    case 'alt': return Key.LeftAlt;
-                    case 'shift': return Key.LeftShift;
-                    case 'meta': return Key.LeftSuper;
-                    case 'cmd': return Key.LeftSuper;
-                    case 'super': return Key.LeftSuper;
-                    case 'tab': return Key.Tab;
-                    case 'enter': return Key.Return;
-                    case 'escape': return Key.Escape;
-                    case 'space': return Key.Space;
-                    default: return key.toLowerCase();
-                }
-            });
-            
-            // Press all keys together
-            await keyboard.pressKey(...nutKeys);
-            await keyboard.releaseKey(...nutKeys);
-            
-            const processingTime = performance.now() - startTime;
-            console.log(`⌨️ Key combo ${keys.join('+')} took ${processingTime.toFixed(2)}ms`);
-            
-        } catch (error) {
-            console.error('❌ Key combination error:', error.message);
-        }
+        session.performanceMonitor.recordEvent('keyboard', 0);
     });
 
-    // Change quality with immediate effect
+    // Quality and FPS control
     socket.on('change-quality', (data) => {
         const { sessionId, quality } = data;
         const session = sessions.get(sessionId);
@@ -611,23 +556,50 @@ io.on('connection', (socket) => {
         if (!session || session.hostSocket !== socket.id) return;
         
         session.quality = quality;
+        session.qualitySettings = ADAPTIVE_QUALITY_SETTINGS[quality];
+        session.currentFPS = session.qualitySettings.baseFps;
         
-        // Restart screen capture with new quality
-        if (session.captureInterval) {
-            clearInterval(session.captureInterval);
-            startOptimizedScreenCapture(sessionId);
-        }
+        // Notify all participants
+        io.to(`session-${sessionId}`).emit('quality-changed', { 
+            quality, 
+            currentFPS: session.currentFPS 
+        });
         
-        console.log(`📊 Quality changed: ${sessionId} -> ${quality}`);
+        console.log(`📊 Quality changed: ${sessionId} -> ${quality} (${session.currentFPS} FPS)`);
     });
 
-    // End session
+    socket.on('fps-adjustment', (data) => {
+        const { sessionId, fps } = data;
+        const session = sessions.get(sessionId);
+        
+        if (!session || session.hostSocket !== socket.id) return;
+        
+        const settings = session.qualitySettings;
+        session.currentFPS = Math.max(settings.minFps, Math.min(settings.maxFps, fps));
+        
+        io.to(`session-${sessionId}`).emit('fps-changed', { fps: session.currentFPS });
+        
+        session.performanceMonitor.recordAdaptiveFPSChange();
+        console.log(`🎛️ FPS adjusted: ${sessionId} -> ${session.currentFPS}`);
+    });
+
+    // Performance stats relay
+    socket.on('client-performance-stats', (data) => {
+        const { sessionId } = data;
+        
+        io.to(`session-${sessionId}`).emit('relay-performance-stats', {
+            ...data,
+            relayLatency: clientInfo.latency,
+            serverStats: sessions.get(sessionId)?.performanceMonitor?.getStats()
+        });
+    });
+
+    // Session management
     socket.on('end-session', (data) => {
         const { sessionId } = data;
         endSession(sessionId, socket.id);
     });
 
-    // Disconnect from session
     socket.on('disconnect-from-session', (data) => {
         const { sessionId } = data;
         const session = sessions.get(sessionId);
@@ -673,119 +645,80 @@ io.on('connection', (socket) => {
     });
 });
 
-// Optimized screen capture with delta compression and adaptive quality
-function startOptimizedScreenCapture(sessionId) {
-    const session = sessions.get(sessionId);
-    if (!session || !session.isActive) return;
+// Adaptive FPS functions
+function updateAdaptiveFPS(socketId, latency) {
+    const session = Array.from(sessions.values()).find(s => 
+        s.hostSocket === socketId || s.controllers.some(c => c.socketId === socketId)
+    );
     
-    if (!screenshot) {
-        console.warn('⚠️ Screenshot library not available');
-        return;
+    if (!session || !session.adaptiveFPS) return;
+    
+    const settings = session.qualitySettings;
+    const targetFPS = calculateOptimalFPS(latency, settings);
+    
+    if (Math.abs(targetFPS - session.currentFPS) >= 2) {
+        session.currentFPS = targetFPS;
+        
+        io.to(`session-${session.id}`).emit('adaptive-fps-change', { 
+            fps: session.currentFPS,
+            reason: `latency: ${latency}ms`
+        });
+        
+        session.performanceMonitor.recordAdaptiveFPSChange();
+    }
+}
+
+function calculateOptimalFPS(latency, settings) {
+    if (latency > settings.latencyThreshold * 1.5) {
+        return settings.minFps;
+    } else if (latency < settings.latencyThreshold * 0.7) {
+        return settings.maxFps;
+    } else {
+        // Linear interpolation between min and max based on latency
+        const ratio = Math.max(0, Math.min(1, 
+            (settings.latencyThreshold * 1.5 - latency) / 
+            (settings.latencyThreshold * 0.8)
+        ));
+        return Math.round(settings.minFps + (settings.maxFps - settings.minFps) * ratio);
+    }
+}
+
+function checkAndAdjustFPS(sessionId) {
+    const session = sessions.get(sessionId);
+    if (!session || !session.adaptiveFPS) return;
+    
+    // Calculate current actual FPS based on frame intervals
+    const now = Date.now();
+    const timeSinceLastCheck = now - (session.lastFpsCheck || now - 1000);
+    const framesSinceLastCheck = session.frameCount - (session.lastFrameCheck || 0);
+    
+    if (timeSinceLastCheck > 0) {
+        const actualFPS = Math.round((framesSinceLastCheck * 1000) / timeSinceLastCheck);
+        
+        // Adjust target FPS if actual FPS is consistently different
+        if (Math.abs(actualFPS - session.currentFPS) > 5) {
+            const newFPS = Math.max(session.qualitySettings.minFps, 
+                                  Math.min(session.qualitySettings.maxFps, actualFPS));
+            
+            if (newFPS !== session.currentFPS) {
+                session.currentFPS = newFPS;
+                
+                io.to(`session-${sessionId}`).emit('adaptive-fps-change', { 
+                    fps: session.currentFPS,
+                    reason: `performance adjustment: actual ${actualFPS} vs target ${session.currentFPS}`
+                });
+            }
+        }
     }
     
-    const qualitySettings = QUALITY_SETTINGS[session.quality] || QUALITY_SETTINGS.medium;
-    
-    console.log(`📸 Starting optimized screen capture: ${sessionId} (${session.quality}, ${qualitySettings.fps}fps)`);
-    
-    // Use setImmediate for better performance than setInterval
-    const captureFrame = async () => {
-        const currentSession = sessions.get(sessionId);
-        if (!currentSession || !currentSession.isActive) return;
-        
-        const frameStartTime = performance.now();
-        
-        try {
-            // Capture screen with optimized settings
-            const captureStart = performance.now();
-            
-            const img = await screenshot({ 
-                format: 'jpg',
-                quality: qualitySettings.quality
-            });
-            
-            if (!img) return;
-            
-            const captureTime = performance.now() - captureStart;
-            currentSession.performanceMonitor.recordCapture(captureTime);
-            
-            // Convert to base64 (consider binary transmission in future)
-            const encodeStart = performance.now();
-            const base64Image = img.toString('base64');
-            const imageData = `data:image/jpeg;base64,${base64Image}`;
-            const encodeTime = performance.now() - encodeStart;
-            currentSession.performanceMonitor.recordEncode(encodeTime);
-            
-            // Get screen dimensions
-            let screenSize = { width: 1920, height: 1080 };
-            
-            if (screen) {
-                try {
-                    screenSize = await screen.size();
-                } catch (e) {
-                    // Use fallback
-                }
-            }
-            
-            const screenData = {
-                image: imageData,
-                width: screenSize.width,
-                height: screenSize.height,
-                timestamp: Date.now(),
-                quality: currentSession.quality,
-                frameNumber: currentSession.performanceMonitor.metrics.frameCount,
-                captureTime: Math.round(captureTime),
-                encodeTime: Math.round(encodeTime),
-                compression: qualitySettings.compression
-            };
-            
-            // Send to all controllers
-            const transmitStart = performance.now();
-            io.to(`session-${sessionId}`).emit('screen-update', screenData);
-            const transmitTime = performance.now() - transmitStart;
-            
-            currentSession.performanceMonitor.recordTransmit(transmitTime, base64Image.length);
-            
-            // Send performance stats every 30 frames
-            if (currentSession.performanceMonitor.metrics.frameCount % 30 === 0) {
-                const stats = currentSession.performanceMonitor.getStats();
-                io.to(`session-${sessionId}`).emit('performance-stats', {
-                    ...stats,
-                    frameLatency: performance.now() - frameStartTime
-                });
-                
-                // Log performance metrics
-                console.log(`📊 ${sessionId}: ${stats.totalLatency.toFixed(1)}ms total, ${stats.avgFps.toFixed(1)} fps`);
-            }
-            
-        } catch (error) {
-            console.error(`❌ Screen capture error for ${sessionId}:`, error.message);
-        }
-        
-        // Schedule next frame with adaptive timing
-        const frameTime = performance.now() - frameStartTime;
-        const targetInterval = qualitySettings.interval;
-        const nextFrameDelay = Math.max(0, targetInterval - frameTime);
-        
-        setTimeout(() => {
-            if (sessions.get(sessionId)?.isActive) {
-                setImmediate(captureFrame);
-            }
-        }, nextFrameDelay);
-    };
-    
-    // Start the capture loop
-    setImmediate(captureFrame);
+    session.lastFpsCheck = now;
+    session.lastFrameCheck = session.frameCount;
 }
 
 // End session function
 function endSession(sessionId, requesterId = null) {
     const session = sessions.get(sessionId);
     if (!session) return;
-    
-    // Stop screen capture
-    if (session.captureInterval) {
-        clearInterval(session.captureInterval);
-    }
     
     // Get final performance stats
     const finalStats = session.performanceMonitor ? session.performanceMonitor.getStats() : null;
@@ -802,7 +735,7 @@ function endSession(sessionId, requesterId = null) {
     
     console.log(`🔴 Session ended: ${sessionId} (${session.controllers.length} controllers)`);
     if (finalStats) {
-        console.log(`📊 Final stats: ${finalStats.totalLatency.toFixed(1)}ms avg latency, ${finalStats.avgFps.toFixed(1)} fps`);
+        console.log(`📊 Final stats: ${finalStats.eventsProcessed} events, ${finalStats.mbTransferred.toFixed(2)}MB transferred`);
     }
 }
 
@@ -821,59 +754,68 @@ setInterval(() => {
     });
 }, 5 * 60 * 1000);
 
+// Performance monitoring
+setInterval(() => {
+    const activeSessionsCount = Array.from(sessions.values()).filter(s => s.isActive).length;
+    const totalEvents = Object.values(eventQueue.queues).reduce((sum, q) => sum + q.length, 0);
+    
+    if (totalEvents > 100) {
+        console.log(`⚠️ High event queue load: ${totalEvents} events pending`);
+    }
+    
+    if (activeSessionsCount > 0) {
+        console.log(`📈 Active sessions: ${activeSessionsCount}, Queue size: ${totalEvents}, Clients: ${connectedClients.size}`);
+    }
+}, 30000);
+
 // Server startup
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 
 server.listen(PORT, HOST, () => {
     console.log('='.repeat(60));
-    console.log('🚀 Low Latency Remote Desktop Server Started');
+    console.log('🚀 Low Latency Remote Desktop Relay Server');
     console.log('='.repeat(60));
-    console.log(`🔡 Server running on: http://${HOST}:${PORT}`);
+    console.log(`🔗 Server running on: http://${HOST}:${PORT}`);
     console.log(`🏥 Health check: http://${HOST}:${PORT}/health`);
     console.log(`📊 API endpoint: http://${HOST}:${PORT}/api/sessions`);
     console.log(`🌍 Platform: ${os.platform()} ${os.arch()}`);
     console.log(`💾 Memory: ${Math.round(os.totalmem() / 1024 / 1024 / 1024)}GB`);
-    console.log(`🖥️ Screenshot support: ${screenshot ? '✅' : '❌'}`);
-    console.log(`🎮 Nut.js control support: ${mouse ? '✅' : '❌'}`);
     console.log('='.repeat(60));
-    console.log(`💡 Optimizations Enabled:`);
-    console.log(`   - WebSocket-only transport for lower latency`);
-    console.log(`   - Compression disabled for speed`);
-    console.log(`   - Nut.js with zero-delay configuration`);
-    console.log(`   - Adaptive frame timing`);
-    console.log(`   - Performance monitoring`);
-    console.log(`   - JPEG compression for better speed/quality ratio`);
-    console.log(`   - Delta frame compression ready`);
+    console.log(`⚡ Optimizations Enabled:`);
+    console.log(`   ✅ Binary frame transmission`);
+    console.log(`   ✅ Input event prioritization`);
+    console.log(`   ✅ Adaptive FPS control`);
+    console.log(`   ✅ WebSocket-only transport`);
+    console.log(`   ✅ Compression disabled for speed`);
+    console.log(`   ✅ Priority-based event queue`);
     console.log('='.repeat(60));
-    console.log(`📝 Installation Notes:`);
-    console.log(`   npm install @nut-tree-fork/nut-js screenshot-desktop`);
-    console.log(`   - @nut-tree-fork/nut-js: Modern cross-platform automation`);
-    console.log(`   - Configured for zero-delay, instant response`);
-    console.log(`   - Press Ctrl+C to stop the server`);
+    console.log(`📝 Connection Only - No Screen Capture:`);
+    console.log(`   • Screen capture moved to Electron frontend`);
+    console.log(`   • Server acts as optimized relay only`);
+    console.log(`   • FFmpeg integration on client side`);
+    console.log(`   • Cross-platform input via RobotJS/Nut.js`);
     console.log('='.repeat(60));
 });
 
-// Graceful shutdown with cleanup
+// Graceful shutdown
 process.on('SIGINT', () => {
-    console.log('\n🛑 Shutting down server...');
+    console.log('\n🛑 Shutting down relay server...');
     
     // End all sessions with performance summary
     sessions.forEach((session, sessionId) => {
         if (session.performanceMonitor) {
             const stats = session.performanceMonitor.getStats();
-            console.log(`📊 Session ${sessionId} final stats: ${stats.totalLatency.toFixed(1)}ms latency, ${stats.avgFps.toFixed(1)} fps`);
+            console.log(`📊 Session ${sessionId}: ${stats.eventsProcessed} events, ${stats.mbTransferred.toFixed(2)}MB`);
         }
         endSession(sessionId);
     });
     
-    // Close server
     server.close(() => {
-        console.log('✅ Server closed gracefully');
+        console.log('✅ Relay server closed gracefully');
         process.exit(0);
     });
     
-    // Force exit after 10 seconds
     setTimeout(() => {
         console.log('⚠️ Forcing server shutdown');
         process.exit(1);
@@ -893,7 +835,7 @@ process.on('SIGTERM', () => {
     });
 });
 
-// Handle unhandled errors
+// Enhanced error handling
 process.on('uncaughtException', (error) => {
     console.error('💥 Uncaught Exception:', error);
     console.error('Stack:', error.stack);
@@ -910,7 +852,7 @@ setInterval(() => {
     const memUsage = process.memoryUsage();
     const memMB = Math.round(memUsage.rss / 1024 / 1024);
     
-    if (memMB > 500) { // Alert if using more than 500MB
+    if (memMB > 500) {
         console.log(`⚠️ High memory usage: ${memMB}MB RSS, ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB heap`);
     }
-}, 30000); // Check every 30 seconds
+}, 30000);
