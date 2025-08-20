@@ -769,10 +769,12 @@ setInterval(() => {
 }, 30000);
 
 // Server startup
-const PORT =  3000;
+// Use Render's assigned port if available
+const PORT = process.env.PORT || 3001;
+const HOST = '0.0.0.0';
 
 
-server.listen(PORT, () => {
+server.listen(PORT, HOST, () => {
     console.log('='.repeat(60));
     console.log('🚀 Low Latency Remote Desktop Relay Server');
     console.log('='.repeat(60));
@@ -856,4 +858,3 @@ setInterval(() => {
         console.log(`⚠️ High memory usage: ${memMB}MB RSS, ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB heap`);
     }
 }, 30000);
-
