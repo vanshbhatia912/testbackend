@@ -769,10 +769,10 @@ setInterval(() => {
 }, 30000);
 
 // Server startup
-const PORT = process.env.PORT || 3000;
-const HOST = process.env.HOST || '0.0.0.0';
+const PORT =  3000;
 
-server.listen(PORT, HOST, () => {
+
+server.listen(PORT, () => {
     console.log('='.repeat(60));
     console.log('🚀 Low Latency Remote Desktop Relay Server');
     console.log('='.repeat(60));
@@ -856,3 +856,4 @@ setInterval(() => {
         console.log(`⚠️ High memory usage: ${memMB}MB RSS, ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB heap`);
     }
 }, 30000);
+
