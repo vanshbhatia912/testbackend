@@ -4,27 +4,26 @@ const socketIo = require('socket.io');
 const cors = require('cors');
 const path = require('path');
 const os = require('os');
-const { performance } = require('perf_hooks');
 
 const app = express();
 const server = http.createServer(app);
 
-// WebRTC-optimized Socket.IO configuration
+// Enhanced Socket.IO configuration for multi-user WebRTC
 const io = socketIo(server, {
     cors: {
         origin: "*",
         methods: ["GET", "POST", "PUT", "DELETE"],
         credentials: true
     },
-    transports: ['websocket'], // WebSocket only for signaling
+    transports: ['websocket', 'polling'], // Support both for better compatibility
     allowEIO3: true,
-    pingTimeout: 30000,        // Shorter timeouts for WebRTC
-    pingInterval: 10000,
-    upgradeTimeout: 5000,
-    maxHttpBufferSize: 10e6,   // Smaller buffer - WebRTC handles media
-    compression: true,         // Compress signaling data
+    pingTimeout: 60000,        // Longer timeout for cross-platform
+    pingInterval: 25000,       // More frequent pings
+    upgradeTimeout: 10000,     // Extended upgrade timeout
+    maxHttpBufferSize: 10e6,
+    compression: true,
     perMessageDeflate: {
-        threshold: 1024,       // Only compress larger messages
+        threshold: 1024,
         concurrencyLimit: 10,
         windowBits: 15,
         serverMaxNoContextTakeover: true
@@ -32,148 +31,69 @@ const io = socketIo(server, {
 });
 
 // Middleware
-app.use(cors({
-    origin: "*",
-    credentials: true
-}));
+app.use(cors({ origin: "*", credentials: true }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-
-// Static files
 app.use(express.static(path.join(__dirname, 'public')));
 
-// WebRTC Sessions storage
+// Enhanced session storage with multi-user support
 const sessions = new Map();
 const connectedClients = new Map();
+const userColors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8'];
 
-// WebRTC STUN/TURN configuration
+// ICE servers with better cross-platform support
 const ICE_SERVERS = [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
-    // Add TURN servers for production:
-    // {
-    //     urls: 'turn:your-turn-server.com:3478',
-    //     username: 'username',
-    //     credential: 'password'
-    // }
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun4.l.google.com:19302' },
+    // Additional STUN servers for better connectivity
+    { urls: 'stun:stun.12connect.com:3478' },
+    { urls: 'stun:stun.12voip.com:3478' },
+    { urls: 'stun:stun.1und1.de:3478' }
 ];
 
-// Priority queue for WebRTC signaling (faster than media relay)
-class WebRTCSignalingQueue {
+// Network quality monitoring
+class NetworkQualityMonitor {
     constructor() {
-        this.queues = {
-            1: [], // ICE candidates (highest priority)
-            2: [], // SDP offers/answers
-            3: [], // DataChannel messages (input events)
-            4: []  // General signaling
+        this.qualityLevels = {
+            excellent: { minBandwidth: 5000000, maxLatency: 50, maxPacketLoss: 1 },
+            good: { minBandwidth: 2000000, maxLatency: 100, maxPacketLoss: 3 },
+            fair: { minBandwidth: 1000000, maxLatency: 200, maxPacketLoss: 5 },
+            poor: { minBandwidth: 500000, maxLatency: 500, maxPacketLoss: 10 }
         };
-        this.processing = false;
     }
 
-    enqueue(event, priority = 4) {
-        this.queues[priority].push({
-            ...event,
-            timestamp: performance.now()
-        });
-        
-        if (!this.processing) {
-            this.process();
+    assessQuality(bandwidth, latency, packetLoss) {
+        if (bandwidth >= this.qualityLevels.excellent.minBandwidth && 
+            latency <= this.qualityLevels.excellent.maxLatency && 
+            packetLoss <= this.qualityLevels.excellent.maxPacketLoss) {
+            return 'excellent';
+        } else if (bandwidth >= this.qualityLevels.good.minBandwidth && 
+                   latency <= this.qualityLevels.good.maxLatency && 
+                   packetLoss <= this.qualityLevels.good.maxPacketLoss) {
+            return 'good';
+        } else if (bandwidth >= this.qualityLevels.fair.minBandwidth && 
+                   latency <= this.qualityLevels.fair.maxLatency && 
+                   packetLoss <= this.qualityLevels.fair.maxPacketLoss) {
+            return 'fair';
         }
+        return 'poor';
     }
 
-    async process() {
-        this.processing = true;
-        
-        // Process in priority order: ICE > SDP > DataChannel > General
-        for (let priority = 1; priority <= 4; priority++) {
-            while (this.queues[priority].length > 0) {
-                const event = this.queues[priority].shift();
-                await this.handleEvent(event);
-            }
-        }
-        
-        this.processing = false;
-        
-        // Check if more events arrived during processing
-        if (this.hasEvents()) {
-            setImmediate(() => this.process());
-        }
-    }
-
-    hasEvents() {
-        return Object.values(this.queues).some(queue => queue.length > 0);
-    }
-
-    async handleEvent(event) {
-        try {
-            if (event.targetSocket) {
-                io.to(event.targetSocket).emit(event.type, event.data);
-            } else if (event.sessionId) {
-                io.to(`session-${event.sessionId}`).emit(event.type, event.data);
-            }
-        } catch (error) {
-            console.error('❌ WebRTC signaling error:', error);
-        }
+    getRecommendedSettings(quality) {
+        const settings = {
+            excellent: { resolution: '2k', frameRate: 60, bitrate: 8000000 },
+            good: { resolution: '1080p', frameRate: 60, bitrate: 4000000 },
+            fair: { resolution: '720p', frameRate: 30, bitrate: 2000000 },
+            poor: { resolution: '480p', frameRate: 24, bitrate: 1000000 }
+        };
+        return settings[quality] || settings.poor;
     }
 }
 
-// Global signaling queue
-const signalingQueue = new WebRTCSignalingQueue();
-
-// WebRTC Performance Monitor
-class WebRTCPerformanceMonitor {
-    constructor() {
-        this.metrics = {
-            signalingSent: 0,
-            iceExchanges: 0,
-            sdpExchanges: 0,
-            dataChannelMessages: 0,
-            averageSignalingLatency: 0,
-            connectionEstablishTime: 0,
-            lastConnectionTime: 0
-        };
-        this.startTime = performance.now();
-        this.signalingLatencies = [];
-    }
-
-    recordSignaling(type, latency) {
-        this.metrics.signalingSent++;
-        
-        if (type === 'ice-candidate') {
-            this.metrics.iceExchanges++;
-        } else if (type.includes('sdp')) {
-            this.metrics.sdpExchanges++;
-        } else if (type === 'datachannel') {
-            this.metrics.dataChannelMessages++;
-        }
-
-        if (latency) {
-            this.signalingLatencies.push(latency);
-            if (this.signalingLatencies.length > 50) {
-                this.signalingLatencies = this.signalingLatencies.slice(-25);
-            }
-            
-            const sum = this.signalingLatencies.reduce((a, b) => a + b, 0);
-            this.metrics.averageSignalingLatency = sum / this.signalingLatencies.length;
-        }
-    }
-
-    recordConnection() {
-        const now = performance.now();
-        this.metrics.connectionEstablishTime = now - this.metrics.lastConnectionTime;
-        this.metrics.lastConnectionTime = now;
-    }
-
-    getStats() {
-        const runtime = (performance.now() - this.startTime) / 1000;
-        return {
-            ...this.metrics,
-            runtime: Math.round(runtime),
-            signalingPerSecond: runtime > 0 ? this.metrics.signalingSent / runtime : 0
-        };
-    }
-}
+const qualityMonitor = new NetworkQualityMonitor();
 
 // Utility functions
 function generateSessionId() {
@@ -189,46 +109,110 @@ function generatePassword(length = 8) {
     return password;
 }
 
-function getSystemInfo() {
-    return {
-        platform: os.platform(),
-        arch: os.arch(),
-        hostname: os.hostname(),
-        cpus: os.cpus().length,
-        memory: Math.round(os.totalmem() / 1024 / 1024 / 1024),
-        uptime: os.uptime(),
-        webrtcSupport: true
-    };
+function generateUserName() {
+    const adjectives = ['Swift', 'Bright', 'Cool', 'Smart', 'Fast', 'Pro', 'Elite', 'Super'];
+    const nouns = ['User', 'Guest', 'Player', 'Client', 'Viewer', 'Remote', 'Control', 'Access'];
+    return adjectives[Math.floor(Math.random() * adjectives.length)] + 
+           nouns[Math.floor(Math.random() * nouns.length)] + 
+           Math.floor(Math.random() * 100);
 }
 
-function isValidSession(sessionId, password) {
-    const session = sessions.get(sessionId);
-    return session && session.password === password;
+// Enhanced session class
+class EnhancedSession {
+    constructor(id, password, hostId, platform = 'unknown') {
+        this.id = id;
+        this.password = password;
+        this.hostId = hostId;
+        this.platform = platform;
+        this.createdAt = new Date();
+        this.isActive = false;
+        this.maxUsers = 5;
+        this.users = new Map(); // userId -> userInfo
+        this.qualitySettings = {
+            current: '1080p',
+            adaptive: true,
+            available: ['2k', '1080p', '720p', '480p']
+        };
+        this.networkStats = {
+            totalBandwidth: 0,
+            averageLatency: 0,
+            packetLoss: 0,
+            quality: 'good'
+        };
+        this.rtpPort = null;
+    }
+
+    addUser(userId, userInfo) {
+        if (this.users.size >= this.maxUsers) {
+            throw new Error('Session is full');
+        }
+
+        const color = userColors[this.users.size % userColors.length];
+        const userName = userInfo.userName || generateUserName();
+
+        this.users.set(userId, {
+            ...userInfo,
+            userName,
+            color,
+            joinedAt: new Date(),
+            isConnected: false,
+            networkQuality: 'unknown'
+        });
+
+        return { userName, color };
+    }
+
+    removeUser(userId) {
+        return this.users.delete(userId);
+    }
+
+    getConnectedUsers() {
+        return Array.from(this.users.entries())
+            .filter(([_, user]) => user.isConnected)
+            .map(([id, user]) => ({ id, ...user }));
+    }
+
+    updateNetworkStats(bandwidth, latency, packetLoss) {
+        this.networkStats.totalBandwidth = bandwidth;
+        this.networkStats.averageLatency = latency;
+        this.networkStats.packetLoss = packetLoss;
+        this.networkStats.quality = qualityMonitor.assessQuality(bandwidth, latency, packetLoss);
+        
+        // Adjust quality if adaptive is enabled
+        if (this.qualitySettings.adaptive) {
+            const recommended = qualityMonitor.getRecommendedSettings(this.networkStats.quality);
+            if (recommended.resolution !== this.qualitySettings.current) {
+                this.qualitySettings.current = recommended.resolution;
+                return recommended;
+            }
+        }
+        
+        return null;
+    }
 }
 
-// Routes with WebRTC info
+// Routes
 app.get('/', (req, res) => {
     res.json({
-        name: 'WebRTC Remote Desktop Signaling Server',
-        version: '2.0.0',
-        platform: os.platform(),
-        arch: os.arch(),
-        status: 'running',
+        name: 'Enhanced WebRTC Remote Desktop Server',
+        version: '2.1.0',
+        features: {
+            multiUser: true,
+            adaptiveQuality: true,
+            crossPlatform: true,
+            maxUsersPerSession: 5
+        },
         sessions: sessions.size,
         clients: connectedClients.size,
-        webrtc: {
-            signalingOnly: true,
-            p2pMediaStreaming: true,
-            dataChannelInput: true,
-            ultraLowLatency: true,
-            frameSkipping: true,
-            iceServers: ICE_SERVERS.map(server => server.urls)
-        }
+        platform: os.platform(),
+        uptime: process.uptime()
     });
 });
 
 app.get('/health', (req, res) => {
     const memUsage = process.memoryUsage();
+    const activeSessions = Array.from(sessions.values()).filter(s => s.isActive).length;
+    const totalUsers = Array.from(sessions.values()).reduce((sum, s) => sum + s.users.size, 0);
     
     res.json({
         status: 'healthy',
@@ -238,12 +222,15 @@ app.get('/health', (req, res) => {
             heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024),
             heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024)
         },
-        system: getSystemInfo(),
-        sessions: sessions.size,
-        signalingQueueSize: Object.values(signalingQueue.queues).reduce((sum, q) => sum + q.length, 0),
+        sessions: {
+            total: sessions.size,
+            active: activeSessions,
+            users: totalUsers
+        },
         webrtc: {
             iceServers: ICE_SERVERS.length,
-            activeSessions: Array.from(sessions.values()).filter(s => s.webrtcConnected).length
+            multiUserSupport: true,
+            adaptiveQuality: true
         },
         timestamp: new Date().toISOString()
     });
@@ -252,339 +239,435 @@ app.get('/health', (req, res) => {
 app.get('/api/sessions', (req, res) => {
     const sessionList = Array.from(sessions.values()).map(session => ({
         id: session.id,
-        createdAt: session.createdAt,
         isActive: session.isActive,
-        hostConnected: !!session.hostSocket,
-        controllerCount: session.controllers.length,
         platform: session.platform,
-        webrtcConnected: session.webrtcConnected,
-        rtpPort: session.rtpPort,
-        performance: session.performanceMonitor ? session.performanceMonitor.getStats() : null
+        userCount: session.users.size,
+        maxUsers: session.maxUsers,
+        quality: session.qualitySettings.current,
+        networkQuality: session.networkStats.quality,
+        createdAt: session.createdAt
     }));
     
     res.json(sessionList);
 });
 
-// WebRTC ICE servers endpoint
-app.get('/api/ice-servers', (req, res) => {
-    res.json({
-        iceServers: ICE_SERVERS
-    });
-});
-
-// Socket.IO WebRTC signaling
+// Socket.IO connection handling
 io.on('connection', (socket) => {
     const clientInfo = {
         id: socket.id,
         ip: socket.handshake.address,
         userAgent: socket.handshake.headers['user-agent'],
         connectedAt: new Date(),
-        signalingLatency: 0,
-        webrtcSupported: true
+        platform: 'unknown',
+        latency: 0
     };
     
     connectedClients.set(socket.id, clientInfo);
     
-    console.log(`🔗 WebRTC client connected: ${socket.id} from ${clientInfo.ip}`);
-    console.log(`📊 Total clients: ${connectedClients.size}, Active sessions: ${sessions.size}`);
+    console.log(`🔗 Client connected: ${socket.id} from ${clientInfo.ip}`);
+    console.log(`📊 Total clients: ${connectedClients.size}, Sessions: ${sessions.size}`);
 
-    // Send ICE servers configuration
+    // Send ICE servers
     socket.emit('ice-servers', { iceServers: ICE_SERVERS });
 
-    // WebRTC signaling latency measurement
+    // Ping/pong for latency measurement
     socket.on('ping', (timestamp) => {
         const latency = Date.now() - timestamp;
-        clientInfo.signalingLatency = latency;
+        clientInfo.latency = latency;
         socket.emit('pong', { timestamp, latency });
     });
 
-    // Create WebRTC session
+    // Create session
     socket.on('create-session', (data) => {
-        const { platform = 'unknown', webrtcCapabilities = {} } = data;
+        const { platform = 'unknown', maxUsers = 5, webrtcCapabilities = {} } = data;
         
         const sessionId = generateSessionId();
         const password = generatePassword();
         
-        const session = {
-            id: sessionId,
-            password,
-            createdAt: new Date(),
-            isActive: false,
-            hostSocket: socket.id,
-            controllers: [],
-            platform,
-            performanceMonitor: new WebRTCPerformanceMonitor(),
-            // WebRTC specific
-            webrtcConnected: false,
-            rtpPort: null,
-            iceServers: ICE_SERVERS,
-            webrtcCapabilities
-        };
+        const session = new EnhancedSession(sessionId, password, socket.id, platform);
+        session.maxUsers = Math.min(maxUsers, 5); // Enforce max limit
         
         sessions.set(sessionId, session);
         socket.join(`session-${sessionId}`);
         
-        socket.emit('session-created', {
-            success: true,
-            sessionId,
-            password,
-            platform,
-            iceServers: ICE_SERVERS,
-            webrtcEnabled: true
-        });
-        
-        console.log(`🎯 WebRTC session created: ${sessionId} by ${socket.id}`);
+        // Add host as first user
+        try {
+            const hostInfo = session.addUser(socket.id, {
+                isHost: true,
+                platform,
+                webrtcCapabilities
+            });
+            
+            clientInfo.sessionId = sessionId;
+            clientInfo.isHost = true;
+            
+            socket.emit('session-created', {
+                success: true,
+                sessionId,
+                password,
+                hostInfo,
+                iceServers: ICE_SERVERS
+            });
+            
+            console.log(`🎯 Session created: ${sessionId} (${platform}) - Max users: ${session.maxUsers}`);
+        } catch (error) {
+            socket.emit('session-error', { message: error.message });
+        }
     });
 
-    // Start WebRTC hosting
+    // Start hosting
     socket.on('start-webrtc-host', (data) => {
-        const { sessionId, password, rtpPort } = data;
-        
-        if (!isValidSession(sessionId, password)) {
-            socket.emit('host-error', { message: 'Invalid session or password' });
-            return;
-        }
+        const { sessionId, password, qualitySettings = {}, maxUsers = 5 } = data;
         
         const session = sessions.get(sessionId);
-        if (session.hostSocket !== socket.id) {
-            socket.emit('host-error', { message: 'Not authorized to host this session' });
+        if (!session || session.password !== password || session.hostId !== socket.id) {
+            socket.emit('host-error', { message: 'Invalid session or unauthorized' });
             return;
         }
         
         session.isActive = true;
-        session.rtpPort = rtpPort;
-        session.performanceMonitor = new WebRTCPerformanceMonitor();
+        session.maxUsers = Math.min(maxUsers, 5);
+        session.rtpPort = data.rtpPort || 5004;
+        
+        if (qualitySettings) {
+            session.qualitySettings = { ...session.qualitySettings, ...qualitySettings };
+        }
         
         socket.emit('webrtc-host-ready', { 
             success: true,
-            rtpPort: rtpPort,
-            iceServers: ICE_SERVERS
+            rtpPort: session.rtpPort,
+            maxUsers: session.maxUsers,
+            iceServers: ICE_SERVERS,
+            qualitySettings: session.qualitySettings
         });
         
-        console.log(`🖥️ WebRTC host started: ${sessionId} (RTP port: ${rtpPort})`);
+        console.log(`Host started: ${sessionId} (Port: ${session.rtpPort}, Max users: ${session.maxUsers})`);
     });
 
-    // Join WebRTC session as controller
+    // Join session
     socket.on('join-webrtc-session', (data) => {
-        const { sessionId, password, webrtcCapabilities = {} } = data;
-        
-        if (!isValidSession(sessionId, password)) {
-            socket.emit('join-error', { message: 'Invalid session or password' });
-            return;
-        }
+        const { sessionId, password, userName, webrtcCapabilities = {} } = data;
         
         const session = sessions.get(sessionId);
-        if (!session.isActive) {
-            socket.emit('join-error', { message: 'Session is not active' });
+        if (!session) {
+            socket.emit('join-error', { message: 'Session not found' });
             return;
         }
         
-        const controller = {
-            socketId: socket.id,
-            joinedAt: new Date(),
-            signalingLatency: clientInfo.signalingLatency,
-            webrtcCapabilities
-        };
+        if (session.password !== password) {
+            socket.emit('join-error', { message: 'Invalid password' });
+            return;
+        }
         
-        session.controllers.push(controller);
-        socket.join(`session-${sessionId}`);
+        if (!session.isActive) {
+            socket.emit('join-error', { message: 'Session not active' });
+            return;
+        }
         
-        socket.emit('webrtc-join-ready', { 
-            success: true,
-            sessionInfo: {
-                id: sessionId,
-                platform: session.platform,
-                rtpPort: session.rtpPort,
-                hostConnected: !!session.hostSocket
-            },
-            iceServers: ICE_SERVERS
-        });
-        
-        // Notify host
-        if (session.hostSocket) {
-            io.to(session.hostSocket).emit('controller-joined', {
+        try {
+            const userInfo = session.addUser(socket.id, {
+                userName,
+                isHost: false,
+                webrtcCapabilities,
+                platform: clientInfo.userAgent
+            });
+            
+            socket.join(`session-${sessionId}`);
+            clientInfo.sessionId = sessionId;
+            clientInfo.userName = userInfo.userName;
+            
+            // Notify all users about new participant
+            socket.to(`session-${sessionId}`).emit('user-joined', {
                 userId: socket.id,
-                userCount: session.controllers.length
+                userName: userInfo.userName,
+                color: userInfo.color,
+                userCount: session.users.size
+            });
+            
+            // Send session info to new user
+            socket.emit('webrtc-join-ready', {
+                success: true,
+                sessionInfo: {
+                    id: sessionId,
+                    platform: session.platform,
+                    maxUsers: session.maxUsers,
+                    currentUsers: session.users.size
+                },
+                userInfo: {
+                    userName: userInfo.userName,
+                    color: userInfo.color
+                },
+                iceServers: ICE_SERVERS,
+                connectedUsers: session.getConnectedUsers()
+            });
+            
+            console.log(`User joined: ${userInfo.userName} (${socket.id}) -> ${sessionId} (${session.users.size}/${session.maxUsers})`);
+            
+        } catch (error) {
+            socket.emit('join-error', { message: error.message });
+        }
+    });
+
+    // WebRTC signaling with multi-user support
+    socket.on('webrtc-offer', (data) => {
+        const { sessionId, offer, targetUser } = data;
+        const session = sessions.get(sessionId);
+        
+        if (!session || !session.users.has(socket.id)) return;
+        
+        if (targetUser) {
+            // Direct peer-to-peer offer
+            io.to(targetUser).emit('webrtc-offer', {
+                offer,
+                fromUser: socket.id,
+                sessionId
+            });
+        } else {
+            // Broadcast to all users in session
+            socket.to(`session-${sessionId}`).emit('webrtc-offer', {
+                offer,
+                fromUser: socket.id,
+                sessionId
             });
         }
         
-        console.log(`🎮 WebRTC controller joined: ${socket.id} -> ${sessionId}`);
-    });
-
-    // WebRTC SDP signaling (high priority)
-    socket.on('webrtc-offer', (data) => {
-        const { sessionId, offer, targetPeer } = data;
-        const session = sessions.get(sessionId);
-        
-        if (!session) return;
-        
-        signalingQueue.enqueue({
-            type: 'webrtc-offer',
-            sessionId,
-            data: { offer, fromPeer: socket.id },
-            targetSocket: targetPeer
-        }, 2);
-        
-        session.performanceMonitor.recordSignaling('sdp-offer');
-        console.log(`📡 WebRTC offer: ${socket.id} -> ${targetPeer} (${sessionId})`);
+        console.log(`WebRTC offer: ${socket.id} -> ${targetUser || 'all'} (${sessionId})`);
     });
 
     socket.on('webrtc-answer', (data) => {
-        const { sessionId, answer, targetPeer } = data;
+        const { sessionId, answer, targetUser } = data;
         const session = sessions.get(sessionId);
         
-        if (!session) return;
+        if (!session || !session.users.has(socket.id)) return;
         
-        signalingQueue.enqueue({
-            type: 'webrtc-answer',
-            sessionId,
-            data: { answer, fromPeer: socket.id },
-            targetSocket: targetPeer
-        }, 2);
+        io.to(targetUser).emit('webrtc-answer', {
+            answer,
+            fromUser: socket.id,
+            sessionId
+        });
         
-        session.performanceMonitor.recordSignaling('sdp-answer');
-        console.log(`📡 WebRTC answer: ${socket.id} -> ${targetPeer} (${sessionId})`);
+        console.log(`WebRTC answer: ${socket.id} -> ${targetUser} (${sessionId})`);
     });
 
-    // ICE candidate signaling (highest priority)
     socket.on('webrtc-ice-candidate', (data) => {
-        const { sessionId, candidate, targetPeer } = data;
+        const { sessionId, candidate, targetUser } = data;
         const session = sessions.get(sessionId);
         
-        if (!session) return;
+        if (!session || !session.users.has(socket.id)) return;
         
-        signalingQueue.enqueue({
-            type: 'webrtc-ice-candidate',
-            sessionId,
-            data: { candidate, fromPeer: socket.id },
-            targetSocket: targetPeer
-        }, 1);
-        
-        session.performanceMonitor.recordSignaling('ice-candidate');
+        io.to(targetUser).emit('webrtc-ice-candidate', {
+            candidate,
+            fromUser: socket.id,
+            sessionId
+        });
     });
 
-    // WebRTC connection established
+    // User connection state updates
     socket.on('webrtc-connected', (data) => {
-        const { sessionId } = data;
+        const { sessionId, targetUser } = data;
         const session = sessions.get(sessionId);
         
-        if (session) {
-            session.webrtcConnected = true;
-            session.performanceMonitor.recordConnection();
+        if (session && session.users.has(socket.id)) {
+            const user = session.users.get(socket.id);
+            user.isConnected = true;
             
             socket.to(`session-${sessionId}`).emit('peer-connected', {
-                peerId: socket.id,
-                sessionId
+                userId: socket.id,
+                userName: user.userName,
+                color: user.color
             });
             
-            console.log(`✅ WebRTC P2P connected: ${socket.id} in ${sessionId}`);
+            console.log(`WebRTC connected: ${user.userName} (${socket.id}) in ${sessionId}`);
         }
     });
 
-    // DataChannel input events (medium priority)
-    socket.on('datachannel-input', (data) => {
-        const { sessionId, inputData, targetPeer } = data;
+    // Mouse movement broadcasting
+    socket.on('user-mouse-move', (data) => {
+        const { sessionId, x, y } = data;
         const session = sessions.get(sessionId);
         
-        if (!session) return;
-        
-        signalingQueue.enqueue({
-            type: 'datachannel-input',
-            sessionId,
-            data: inputData,
-            targetSocket: targetPeer
-        }, 3);
-        
-        session.performanceMonitor.recordSignaling('datachannel');
+        if (session && session.users.has(socket.id)) {
+            const user = session.users.get(socket.id);
+            
+            socket.to(`session-${sessionId}`).emit('user-mouse-move', {
+                userId: socket.id,
+                userName: user.userName,
+                color: user.color,
+                x,
+                y,
+                sessionId
+            });
+        }
     });
 
-    // WebRTC stats reporting
-    socket.on('webrtc-stats', (data) => {
-        const { sessionId, stats } = data;
+    // Network quality monitoring
+    socket.on('network-stats', (data) => {
+        const { sessionId, bandwidth, latency, packetLoss } = data;
+        const session = sessions.get(sessionId);
         
-        // Relay stats to other participants
-        socket.to(`session-${sessionId}`).emit('peer-stats', {
-            peerId: socket.id,
-            stats: stats
-        });
+        if (session && session.users.has(socket.id)) {
+            const user = session.users.get(socket.id);
+            user.networkQuality = qualityMonitor.assessQuality(bandwidth || 0, latency || 0, packetLoss || 0);
+            
+            // Update session-wide stats (average of all users)
+            const connectedUsers = session.getConnectedUsers();
+            if (connectedUsers.length > 0) {
+                const avgBandwidth = connectedUsers.reduce((sum, u) => sum + (u.bandwidth || 0), 0) / connectedUsers.length;
+                const avgLatency = connectedUsers.reduce((sum, u) => sum + (u.latency || 0), 0) / connectedUsers.length;
+                const avgPacketLoss = connectedUsers.reduce((sum, u) => sum + (u.packetLoss || 0), 0) / connectedUsers.length;
+                
+                const recommendedSettings = session.updateNetworkStats(avgBandwidth, avgLatency, avgPacketLoss);
+                
+                if (recommendedSettings && session.users.get(session.hostId)?.isHost) {
+                    // Notify all users about quality adjustment
+                    io.to(`session-${sessionId}`).emit('quality-adjustment', {
+                        quality: session.networkStats.quality,
+                        settings: recommendedSettings,
+                        reason: 'Network conditions changed'
+                    });
+                }
+            }
+        }
+    });
+
+    // Quality change requests
+    socket.on('change-quality', (data) => {
+        const { sessionId, quality, settings } = data;
+        const session = sessions.get(sessionId);
+        
+        if (session && session.users.has(socket.id)) {
+            const user = session.users.get(socket.id);
+            
+            // Only host can change quality, or if adaptive is disabled
+            if (user.isHost || !session.qualitySettings.adaptive) {
+                session.qualitySettings.current = quality;
+                
+                socket.to(`session-${sessionId}`).emit('quality-changed', {
+                    quality,
+                    settings,
+                    changedBy: user.userName
+                });
+                
+                console.log(`Quality changed to ${quality} by ${user.userName} in ${sessionId}`);
+            }
+        }
     });
 
     // Session management
     socket.on('end-session', (data) => {
         const { sessionId } = data;
-        endWebRTCSession(sessionId, socket.id);
+        endSession(sessionId, socket.id);
+    });
+
+    socket.on('kick-user', (data) => {
+        const { sessionId, targetUserId } = data;
+        const session = sessions.get(sessionId);
+        
+        if (session && session.hostId === socket.id && session.users.has(targetUserId)) {
+            const targetUser = session.users.get(targetUserId);
+            
+            // Notify the user being kicked
+            io.to(targetUserId).emit('kicked-from-session', {
+                reason: 'Removed by host'
+            });
+            
+            // Remove user from session
+            session.removeUser(targetUserId);
+            
+            // Notify other users
+            socket.to(`session-${sessionId}`).emit('user-left', {
+                userId: targetUserId,
+                userName: targetUser.userName,
+                reason: 'kicked'
+            });
+            
+            console.log(`User kicked: ${targetUser.userName} from ${sessionId}`);
+        }
     });
 
     socket.on('disconnect-from-session', (data) => {
         const { sessionId } = data;
-        const session = sessions.get(sessionId);
-        
-        if (session) {
-            session.controllers = session.controllers.filter(c => c.socketId !== socket.id);
-            socket.leave(`session-${sessionId}`);
-            
-            socket.to(`session-${sessionId}`).emit('peer-disconnected', {
-                peerId: socket.id,
-                userCount: session.controllers.length
-            });
-            
-            console.log(`👋 WebRTC controller left: ${socket.id} from ${sessionId}`);
-        }
+        handleUserLeave(sessionId, socket.id, 'voluntary');
     });
 
     // Handle client disconnect
-    socket.on('disconnect', () => {
+    socket.on('disconnect', (reason) => {
+        const clientInfo = connectedClients.get(socket.id);
+        
+        if (clientInfo && clientInfo.sessionId) {
+            handleUserLeave(clientInfo.sessionId, socket.id, 'disconnect');
+        }
+        
         connectedClients.delete(socket.id);
         
-        sessions.forEach((session, sessionId) => {
-            if (session.hostSocket === socket.id) {
-                console.log(`🖥️ WebRTC host disconnected: ${sessionId}`);
-                endWebRTCSession(sessionId);
-            } else {
-                const wasController = session.controllers.some(c => c.socketId === socket.id);
-                if (wasController) {
-                    session.controllers = session.controllers.filter(c => c.socketId !== socket.id);
-                    
-                    socket.to(`session-${sessionId}`).emit('peer-disconnected', {
-                        peerId: socket.id,
-                        userCount: session.controllers.length
-                    });
-                    
-                    console.log(`🎮 WebRTC controller disconnected: ${socket.id} from ${sessionId}`);
-                }
-            }
-        });
-        
-        console.log(`🔌 WebRTC client disconnected: ${socket.id}`);
-        console.log(`📊 Total clients: ${connectedClients.size}, Active sessions: ${sessions.size}`);
+        console.log(`Client disconnected: ${socket.id} (${reason})`);
+        console.log(`Total clients: ${connectedClients.size}, Sessions: ${sessions.size}`);
+    });
+
+    // Error handling
+    socket.on('error', (error) => {
+        console.error(`Socket error for ${socket.id}:`, error);
     });
 });
 
-// End WebRTC session function
-function endWebRTCSession(sessionId, requesterId = null) {
+// Helper functions
+function handleUserLeave(sessionId, userId, reason = 'unknown') {
     const session = sessions.get(sessionId);
     if (!session) return;
     
-    // Get final performance stats
-    const finalStats = session.performanceMonitor ? session.performanceMonitor.getStats() : null;
+    const user = session.users.get(userId);
+    if (!user) return;
     
-    // Notify all participants
+    // Remove user from session
+    session.removeUser(userId);
+    
+    // If host left, end the session
+    if (session.hostId === userId) {
+        console.log(`Host left: ${sessionId}, ending session`);
+        endSession(sessionId);
+        return;
+    }
+    
+    // Notify other users
+    io.to(`session-${sessionId}`).emit('user-left', {
+        userId,
+        userName: user.userName,
+        userCount: session.users.size,
+        reason
+    });
+    
+    console.log(`User left: ${user.userName} (${userId}) from ${sessionId} - ${reason} (${session.users.size} remaining)`);
+    
+    // Clean up empty sessions
+    if (session.users.size === 0) {
+        console.log(`Session empty: ${sessionId}, cleaning up`);
+        sessions.delete(sessionId);
+    }
+}
+
+function endSession(sessionId, requesterId = null) {
+    const session = sessions.get(sessionId);
+    if (!session) return;
+    
+    // Only host can end session
+    if (requesterId && session.hostId !== requesterId) {
+        return;
+    }
+    
+    // Notify all users
     io.to(`session-${sessionId}`).emit('session-ended', {
         sessionId,
-        endedBy: requesterId,
-        stats: finalStats
+        reason: requesterId ? 'Host ended session' : 'Session timeout',
+        endedBy: requesterId
     });
     
     // Clean up
     sessions.delete(sessionId);
     
-    console.log(`🔴 WebRTC session ended: ${sessionId} (${session.controllers.length} controllers)`);
-    if (finalStats) {
-        console.log(`📊 Final stats: ${finalStats.signalingSent} signals, ${finalStats.averageSignalingLatency.toFixed(2)}ms avg latency`);
-    }
+    console.log(`Session ended: ${sessionId} (${session.users.size} users affected)`);
 }
 
-// Clean up inactive sessions
+// Periodic cleanup and monitoring
 setInterval(() => {
     const now = Date.now();
     const inactiveThreshold = 30 * 60 * 1000; // 30 minutes
@@ -592,115 +675,107 @@ setInterval(() => {
     sessions.forEach((session, sessionId) => {
         const inactiveTime = now - session.createdAt.getTime();
         
+        // Clean up inactive sessions
         if (!session.isActive && inactiveTime > inactiveThreshold) {
-            console.log(`🧹 Cleaning up inactive WebRTC session: ${sessionId}`);
-            endWebRTCSession(sessionId);
+            console.log(`Cleaning up inactive session: ${sessionId}`);
+            endSession(sessionId);
+        }
+        
+        // Clean up sessions with no connected users
+        const connectedUsers = session.getConnectedUsers();
+        if (session.isActive && connectedUsers.length === 0 && inactiveTime > 5 * 60 * 1000) {
+            console.log(`Cleaning up empty session: ${sessionId}`);
+            endSession(sessionId);
         }
     });
-}, 5 * 60 * 1000);
+}, 5 * 60 * 1000); // Check every 5 minutes
 
 // Performance monitoring
 setInterval(() => {
     const activeSessionsCount = Array.from(sessions.values()).filter(s => s.isActive).length;
-    const connectedSessionsCount = Array.from(sessions.values()).filter(s => s.webrtcConnected).length;
-    const totalSignaling = Object.values(signalingQueue.queues).reduce((sum, q) => sum + q.length, 0);
+    const totalUsers = Array.from(sessions.values()).reduce((sum, s) => sum + s.users.size, 0);
+    const connectedUsersCount = Array.from(sessions.values())
+        .reduce((sum, s) => sum + s.getConnectedUsers().length, 0);
     
-    if (totalSignaling > 50) {
-        console.log(`⚠️ High signaling queue load: ${totalSignaling} messages pending`);
+    if (activeSessionsCount > 0 || totalUsers > 0) {
+        console.log(`Active: ${activeSessionsCount} sessions, ${connectedUsersCount}/${totalUsers} users connected, ${connectedClients.size} clients`);
     }
     
-    if (activeSessionsCount > 0) {
-        console.log(`📈 Active: ${activeSessionsCount}, WebRTC Connected: ${connectedSessionsCount}, Queue: ${totalSignaling}, Clients: ${connectedClients.size}`);
+    // Memory usage warning
+    const memUsage = process.memoryUsage();
+    const memMB = Math.round(memUsage.rss / 1024 / 1024);
+    if (memMB > 500) {
+        console.log(`High memory usage: ${memMB}MB RSS`);
     }
-}, 30000);
+}, 30000); // Every 30 seconds
 
 // Server startup
 const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
 
 server.listen(PORT, HOST, () => {
-    console.log('='.repeat(70));
-    console.log('🚀 WebRTC Remote Desktop Signaling Server');
-    console.log('='.repeat(70));
-    console.log(`🔗 Server running on: http://${HOST}:${PORT}`);
-    console.log(`🏥 Health check: http://${HOST}:${PORT}/health`);
-    console.log(`📊 API endpoint: http://${HOST}:${PORT}/api/sessions`);
-    console.log(`🧊 ICE servers: http://${HOST}:${PORT}/api/ice-servers`);
-    console.log(`🌐 Platform: ${os.platform()} ${os.arch()}`);
-    console.log(`💾 Memory: ${Math.round(os.totalmem() / 1024 / 1024 / 1024)}GB`);
-    console.log('='.repeat(70));
-    console.log(`⚡ WebRTC Ultra Low-Latency Features:`);
-    console.log(`   ✅ P2P media streaming (bypasses server)`);
-    console.log(`   ✅ DataChannel input events`);
-    console.log(`   ✅ FFmpeg RTP -> WebRTC bridge`);
-    console.log(`   ✅ Frame skipping for real-time`);
-    console.log(`   ✅ ICE/STUN for NAT traversal`);
-    console.log(`   ✅ Priority-based signaling queue`);
-    console.log(`   ✅ <50ms end-to-end target`);
-    console.log('='.repeat(70));
-    console.log(`🎯 Architecture:`);
-    console.log(`   • Server: WebRTC signaling only`);
-    console.log(`   • Media: Direct P2P UDP streams`);
-    console.log(`   • Input: WebRTC DataChannels`);
-    console.log(`   • Capture: FFmpeg RTP ultra-fast`);
-    console.log('='.repeat(70));
+    console.log('='.repeat(80));
+    console.log('Enhanced WebRTC Remote Desktop Server v2.1.0');
+    console.log('='.repeat(80));
+    console.log(`Server: http://${HOST}:${PORT}`);
+    console.log(`Health: http://${HOST}:${PORT}/health`);
+    console.log(`Platform: ${os.platform()} ${os.arch()}`);
+    console.log(`Memory: ${Math.round(os.totalmem() / 1024 / 1024 / 1024)}GB`);
+    console.log('='.repeat(80));
+    console.log('Enhanced Features:');
+    console.log('  ✓ Multi-user support (up to 5 users per session)');
+    console.log('  ✓ Adaptive quality based on network conditions');
+    console.log('  ✓ Cross-platform compatibility (Windows/Linux/macOS)');
+    console.log('  ✓ Multiple mouse cursors with user identification');
+    console.log('  ✓ Real-time network quality monitoring');
+    console.log('  ✓ Host mouse isolation during remote control');
+    console.log('  ✓ Automatic quality scaling (2K -> 480p)');
+    console.log('  ✓ Enhanced connection reliability');
+    console.log('='.repeat(80));
 });
 
 // Graceful shutdown
 process.on('SIGINT', () => {
-    console.log('\n🛑 Shutting down WebRTC signaling server...');
+    console.log('\nShutting down Enhanced WebRTC server...');
     
-    // End all sessions with performance summary
+    // End all active sessions
     sessions.forEach((session, sessionId) => {
-        if (session.performanceMonitor) {
-            const stats = session.performanceMonitor.getStats();
-            console.log(`📊 Session ${sessionId}: ${stats.signalingSent} signals, ${stats.averageSignalingLatency.toFixed(2)}ms avg`);
+        if (session.isActive) {
+            endSession(sessionId);
         }
-        endWebRTCSession(sessionId);
     });
     
     server.close(() => {
-        console.log('✅ WebRTC signaling server closed gracefully');
+        console.log('Enhanced WebRTC server shutdown complete');
         process.exit(0);
     });
     
+    // Force exit after 10 seconds
     setTimeout(() => {
-        console.log('⚠️ Forcing server shutdown');
+        console.log('Force shutdown');
         process.exit(1);
     }, 10000);
 });
 
 process.on('SIGTERM', () => {
-    console.log('\n🛑 Received SIGTERM, shutting down gracefully...');
+    console.log('Received SIGTERM, shutting down gracefully...');
     
     sessions.forEach((session, sessionId) => {
-        endWebRTCSession(sessionId);
+        endSession(sessionId);
     });
     
     server.close(() => {
-        console.log('✅ Server closed');
+        console.log('Server closed');
         process.exit(0);
     });
 });
 
 // Error handling
 process.on('uncaughtException', (error) => {
-    console.error('💥 Uncaught Exception:', error);
+    console.error('Uncaught Exception:', error);
     console.error('Stack:', error.stack);
-    process.exit(1);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-    console.error('💥 Unhandled Rejection at:', promise, 'reason:', reason);
-    process.exit(1);
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
-
-// Memory monitoring
-setInterval(() => {
-    const memUsage = process.memoryUsage();
-    const memMB = Math.round(memUsage.rss / 1024 / 1024);
-    
-    if (memMB > 300) {
-        console.log(`⚠️ High memory usage: ${memMB}MB RSS, ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB heap`);
-    }
-}, 60000);
